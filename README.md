@@ -24,4 +24,11 @@ python3 _build/default/test/hello/dist/hello.py
 
 `test/run-hello.sh` runs those commands and checks that the output is `hello`. Python 3.12 or newer is required. The Dune rule copies `melange_runtime` next to the artifact so `python3` can import it.
 
-License: MIT for the Python backend, runtime, and tests. The vendored Melange compiler under `compiler/` stays LGPL-2.1-or-later; see `compiler/COPYING.LESSER`.
+## Licensing
+
+This repository uses two licenses.
+
+- `compiler/` is GNU LGPL-2.1-or-later. It holds the vendored Melange compiler and every modification of that compiler, including the Python backend. Upstream copyright headers stay on those files. The LGPL text is [`compiler/LICENSE`](compiler/LICENSE). [`compiler/COPYING`](compiler/COPYING) and [`compiler/COPYING.LESSER`](compiler/COPYING.LESSER) are the GPL-3 and LGPL-3 texts shipped with Melange.
+- The runtime and tooling are MIT, under the root [`LICENSE`](LICENSE). That covers `runtime/`, `test/`, the root Dune files, and docs. Copyright (c) 2026 Nathan Sculli.
+
+The directory map is in [`docs/adr/0001-repo-layout-and-licensing.md`](docs/adr/0001-repo-layout-and-licensing.md).

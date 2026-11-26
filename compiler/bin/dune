@@ -1,3 +1,5 @@
+; Copyright (C) 2026 Nathan Sculli. LGPL-2.1-or-later. See ../LICENSE.
+
 (executable
  (name melc)
  (public_name melpy)
