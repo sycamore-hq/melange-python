@@ -1,0 +1,4 @@
+(env
+ (_
+  (env-vars
+   (CPPO_FLAGS -D=MELANGE_RELEASE_BUILD))))

@@ -1,0 +1,563 @@
+(* Copyright (C) 2015-2016 Bloomberg Finance L.P.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * In addition to the permissions granted to you by the LGPL, you may combine
+ * or link a "work that uses the Library" with a publicly distributed version
+ * of this file to produce a combined library or application, then distribute
+ * that combined work under the terms of your choosing, with no requirement
+ * to comply with the obligations normally placed on you by section 4 of the
+ * LGPL version 3 (or the corresponding section of a later version of the LGPL
+ * should you choose to use a later version).
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. *)
+
+open Import
+
+module Outcome = struct
+  type t = Eval_false | Eval_true | Eval_unknown
+
+  let[@ocaml.warning "-32"] pp fmt t =
+    let s =
+      match t with
+      | Eval_false -> "Eval_false"
+      | Eval_true -> "Eval_true"
+      | Eval_unknown -> "Eval_unknown"
+    in
+    Format.fprintf fmt "%s" s
+end
+
+(** [field_flatten_get cb v i tbl]
+    try to remove the indirection of [v.(i)] by inlining when [v]
+    is a known block,
+    if not, it will call [cb ()].
+
+    Note due to different control flow, a constant block
+    may result in out-of bound access, in that case, we should
+    just ignore it. This does not mean our
+    optimization is wrong, it means we hit an unreachable branch.
+    for example
+    {{
+      let myShape = A 10 in
+      match myShape with
+      | A x -> x  (* only access field [0]*)
+      | B (x,y) -> x + y (* Here it will try to access field [1] *)
+    }} *)
+let field_flatten_get (tbl : Lam_id_kind.t Ident.Hashtbl.t) ~f v i
+    ~(info : Lambda.field_dbg_info) : Lam.t =
+  match Ident.Hashtbl.find tbl v with
+  | Module g ->
+      Lam.prim
+        ~primitive:(Pfield (i, info))
+        ~args:[ Lam.global_module ~dynamic_import:false g ]
+        ~loc:Location.none
+  | ImmutableBlock arr -> (
+      match arr.(i) with
+      | NA | Function _ | ImmutableBlock _ -> f ()
+      | SimpleForm l -> l
+      | exception _ -> f ())
+  | Constant (Const_block (_, _, ls)) -> (
+      match List.nth ls i with exception Failure _ -> f () | x -> Lam.const x)
+  | _ | (exception Not_found) -> f ()
+
+let simplify_alias =
+  let fully_applied arity args =
+    match Lam_arity.get_first_arity arity with
+    | Some n -> n = List.length args
+    | None -> false
+  in
+  let direct_apply_info (ap_info : Lam.ap_info) =
+    match ap_info.ap_status with
+    | Lam.App_na -> { ap_info with ap_status = Lam.App_infer_full }
+    | Lam.App_infer_full | Lam.App_uncurry -> ap_info
+  in
+  let fully_applied_external arity args =
+    match arity with
+    | Js_cmj_format.Single arity -> fully_applied arity args
+    | Js_cmj_format.Submodule _ -> false
+  in
+  let direct_external_field ~dynamic_import ident name ~loc =
+    Lam.prim ~primitive:(Pfield (0, Fld_module { name }))
+      ~args:[ Lam.global_module ~dynamic_import ident ]
+      ~loc
+  in
+  let direct_primitive_of_value value args =
+    match value with
+    | Lam_id_kind.FunctionId
+        {
+          arity;
+          call_summary = Lam_call_summary.Direct_primitive primitive;
+          _;
+        }
+      when fully_applied arity args ->
+        Some primitive
+    | _ -> None
+  in
+  let direct_external_of_value value args =
+    match value with
+    | Lam_id_kind.FunctionId
+        {
+          call_summary =
+            Lam_call_summary.Direct_external
+                  { dynamic_import; id; name; arity; relocatable = _ };
+          _;
+        }
+      when fully_applied arity args ->
+        Some (dynamic_import, id, name)
+    | _ -> None
+  in
+  let rec id_is_for_sure_true_in_boolean (tbl : Lam_id_kind.t Ident.Hashtbl.t)
+      id =
+    match Ident.Hashtbl.find tbl id with
+    | Normal_optional
+        ( Lprim
+            {
+              loc = _;
+              primitive = Psome_not_nest;
+              args = [ (Lvar id' | Lmutvar id') ];
+            }
+        | Lvar id'
+        | Lmutvar id' ) ->
+        id_is_for_sure_true_in_boolean tbl id'
+    | Normal_optional
+        (Lconst (Const_js_false | Const_js_null | Const_js_undefined _)) ->
+        Outcome.Eval_false
+    | Normal_optional _ | ImmutableBlock _ | MutableBlock _
+    | Constant (Const_block _ | Const_js_true) ->
+        Eval_true
+    | Constant (Const_int { i = 0l; _ }) -> Eval_false
+    | Constant (Const_int { i = _; _ }) -> Eval_true
+    | Constant (Const_js_false | Const_js_null | Const_js_undefined _) ->
+        Eval_false
+    | Constant _ | Module _ | FunctionId _ | Exception | Parameter | NA
+    | OptionalBlock (_, (Undefined | Null | Null_undefined))
+    | (exception Not_found) ->
+        Eval_unknown
+  in
+  let parameter_arg_id (tbl : Lam_id_kind.t Ident.Hashtbl.t) = function
+    | Lam.Lvar p | Lam.Lmutvar p -> (
+        match Ident.Hashtbl.find tbl p with
+        | Parameter -> Some p
+        | _ | exception Not_found -> None)
+    | _ -> None
+  in
+  let rec contains_global_module (lam : Lam.t) =
+    match lam with
+    | Lam.Lglobal_module _ -> true
+    | Lam.Lvar _ | Lam.Lmutvar _ | Lam.Lconst _ -> false
+    | Lam.Lapply { ap_func; ap_args; _ } ->
+        contains_global_module ap_func
+        || List.exists ap_args ~f:contains_global_module
+    | Lam.Lfunction { body; _ } -> contains_global_module body
+    | Lam.Llet (_, _, arg, body) | Lam.Lmutlet (_, arg, body) ->
+        contains_global_module arg || contains_global_module body
+    | Lam.Lletrec (bindings, body) ->
+        List.exists bindings ~f:(fun (_, lam) -> contains_global_module lam)
+        || contains_global_module body
+    | Lam.Lprim { args; _ } -> List.exists args ~f:contains_global_module
+    | Lam.Lswitch (lam, { sw_consts; sw_blocks; sw_failaction; _ }) ->
+        contains_global_module lam
+        || List.exists sw_consts ~f:(fun (_, lam) -> contains_global_module lam)
+        || List.exists sw_blocks ~f:(fun (_, lam) -> contains_global_module lam)
+        ||
+        (match sw_failaction with
+        | Some lam -> contains_global_module lam
+        | None -> false)
+    | Lam.Lstringswitch (lam, cases, default) ->
+        contains_global_module lam
+        || List.exists cases ~f:(fun (_, lam) -> contains_global_module lam)
+        ||
+        (match default with
+        | Some lam -> contains_global_module lam
+        | None -> false)
+    | Lam.Lstaticraise (_, lams) -> List.exists lams ~f:contains_global_module
+    | Lam.Lstaticcatch (lam1, _, lam2) | Lam.Ltrywith (lam1, _, lam2)
+    | Lam.Lsequence (lam1, lam2) | Lam.Lwhile (lam1, lam2) ->
+        contains_global_module lam1 || contains_global_module lam2
+    | Lam.Lifthenelse (lam1, lam2, lam3) ->
+        contains_global_module lam1 || contains_global_module lam2
+        || contains_global_module lam3
+    | Lam.Lfor (_, lam1, lam2, _, lam3) ->
+        contains_global_module lam1 || contains_global_module lam2
+        || contains_global_module lam3
+    | Lam.Lassign (_, lam) | Lam.Lifused (_, lam) -> contains_global_module lam
+    | Lam.Lsend (_, meth, obj, args, _) ->
+        contains_global_module meth || contains_global_module obj
+        || List.exists args ~f:contains_global_module
+  in
+  let cross_module_parameter_result_is_safe (lam : Lam.t) =
+    Lam_analysis.size lam < Lam_analysis.small_inline_size
+    && not (contains_global_module lam)
+  in
+  let parameter_is_captured param (lam : Lam.t) =
+    let rec hit_opt ~under_function = function
+      | Some lam -> hit ~under_function lam
+      | None -> false
+    and hit_list ~under_function lams =
+      List.exists lams ~f:(hit ~under_function)
+    and hit ~under_function (lam : Lam.t) =
+      match lam with
+      | Lam.Lvar id | Lmutvar id -> under_function && Ident.same param id
+      | Lassign (id, lam) ->
+          (under_function && Ident.same param id) || hit ~under_function lam
+      | Lfunction { body; _ } -> hit ~under_function:true body
+      | Llet (_, _, arg, body) | Lmutlet (_, arg, body) ->
+          hit ~under_function arg || hit ~under_function body
+      | Lletrec (bindings, body) ->
+          List.exists bindings ~f:(fun (_, lam) -> hit ~under_function lam)
+          || hit ~under_function body
+      | Lapply { ap_func; ap_args; _ } ->
+          hit ~under_function ap_func || hit_list ~under_function ap_args
+      | Lprim { args; _ } -> hit_list ~under_function args
+      | Lswitch (arg, { sw_consts; sw_blocks; sw_failaction; _ }) ->
+          hit ~under_function arg
+          || List.exists sw_consts ~f:(fun (_, lam) -> hit ~under_function lam)
+          || List.exists sw_blocks ~f:(fun (_, lam) -> hit ~under_function lam)
+          || hit_opt ~under_function sw_failaction
+      | Lstringswitch (arg, cases, default) ->
+          hit ~under_function arg
+          || List.exists cases ~f:(fun (_, lam) -> hit ~under_function lam)
+          || hit_opt ~under_function default
+      | Lstaticraise (_, lams) -> hit_list ~under_function lams
+      | Lstaticcatch (lam1, _, lam2) | Ltrywith (lam1, _, lam2)
+      | Lsequence (lam1, lam2) | Lwhile (lam1, lam2) ->
+          hit ~under_function lam1 || hit ~under_function lam2
+      | Lifthenelse (lam1, lam2, lam3) ->
+          hit ~under_function lam1
+          || hit ~under_function lam2
+          || hit ~under_function lam3
+      | Lfor (_, lam1, lam2, _, lam3) ->
+          hit ~under_function lam1
+          || hit ~under_function lam2
+          || hit ~under_function lam3
+      | Lsend (_, meth, obj, args, _) ->
+          hit ~under_function meth
+          || hit ~under_function obj
+          || hit_list ~under_function args
+      | Lifused (_, lam) -> hit ~under_function lam
+      | Lconst _ | Lglobal_module _ -> false
+    in
+    hit ~under_function:false lam
+  in
+  let rec simpl (meta : Lam_stats.t) (lam : Lam.t) : Lam.t =
+    match lam with
+    | Lvar _ | Lmutvar _ -> lam
+    | Lprim { primitive = Pfield (i, info) as primitive; args = [ arg ]; loc }
+      -> (
+        (* ATTENTION:
+           Main use case, we should detect inline all immutable block .. *)
+        match simpl meta arg with
+        | (Lvar v | Lmutvar v) as l ->
+            field_flatten_get meta.ident_tbl ~info
+              ~f:(fun () -> Lam.prim ~primitive ~args:[ l ] ~loc)
+              v i
+        | l -> Lam.prim ~primitive ~args:[ l ] ~loc)
+    | Lprim { primitive = Popaque; _ } -> lam
+    | Lprim
+        {
+          primitive = (Pval_from_option | Pval_from_option_not_nest) as p;
+          args = [ (Lvar v as lvar) ];
+          _;
+        } as x -> (
+        match Ident.Hashtbl.find meta.ident_tbl v with
+        | OptionalBlock (l, _) -> l
+        | _ | (exception Not_found) ->
+            if p = Pval_from_option_not_nest then lvar else x)
+    | Lglobal_module _ -> lam
+    | Lprim { primitive; args; loc } ->
+        Lam.prim ~primitive ~args:(List.map ~f:(simpl meta) args) ~loc
+    | Lifthenelse
+        ( (Lprim { primitive = Pis_not_none; args = [ Lvar id ]; _ } as l1),
+          l2,
+          l3 ) -> (
+        match Ident.Hashtbl.find meta.ident_tbl id with
+        | ImmutableBlock _ | MutableBlock _ | Normal_optional _ -> simpl meta l2
+        | OptionalBlock (l, Null) ->
+            Lam.if_
+              (Lam.not_ ~loc:Location.none
+                 (Lam.prim ~primitive:Pis_null ~args:[ l ] ~loc:Location.none))
+              (simpl meta l2) (simpl meta l3)
+        | OptionalBlock (l, Undefined) ->
+            Lam.if_
+              (Lam.not_ ~loc:Location.none
+                 (Lam.prim ~primitive:Pis_undefined ~args:[ l ]
+                    ~loc:Location.none))
+              (simpl meta l2) (simpl meta l3)
+        | OptionalBlock (l, Null_undefined) ->
+            Lam.if_
+              (Lam.not_ ~loc:Location.none
+                 (Lam.prim ~primitive:Pis_null_undefined ~args:[ l ]
+                    ~loc:Location.none))
+              (simpl meta l2) (simpl meta l3)
+        | _ | (exception Not_found) ->
+            Lam.if_ l1 (simpl meta l2) (simpl meta l3))
+    (* could be the code path
+       {[ match x with
+         | h::hs ->
+       ]}
+    *)
+    | Lifthenelse (l1, l2, l3) -> (
+        match l1 with
+        | Lvar id | Lmutvar id -> (
+            match id_is_for_sure_true_in_boolean meta.ident_tbl id with
+            | Eval_true -> simpl meta l2
+            | Eval_false -> simpl meta l3
+            | Eval_unknown ->
+                Lam.if_ (simpl meta l1) (simpl meta l2) (simpl meta l3))
+        | _ -> Lam.if_ (simpl meta l1) (simpl meta l2) (simpl meta l3))
+    | Lconst _ -> lam
+    | Llet (str, v, l1, l2) -> Lam.let_ str v (simpl meta l1) (simpl meta l2)
+    | Lmutlet (v, l1, l2) -> Lam.mutlet v (simpl meta l1) (simpl meta l2)
+    | Lletrec (bindings, body) ->
+        let bindings = List.map_snd bindings ~f:(simpl meta) in
+        Lam.letrec bindings (simpl meta body)
+    (* complicated
+           1. inline this function
+           2. ...
+           exports.Make=
+           function(funarg)
+       {var $$let=Make(funarg);
+         return [0, $$let[5],... $$let[16]]}
+    *)
+    | Lapply
+        {
+          ap_func =
+            Lprim
+              {
+                primitive = Pfield (_, Fld_module { name = fld_name });
+                args = [ Lglobal_module { id = ident; dynamic_import } ];
+                _;
+              } as l1;
+          ap_args = args;
+          ap_info;
+        } -> (
+        match
+          Lam_compile_env.query_external_id_info ~dynamic_import ident fld_name
+        with
+        | Some
+            {
+              arity;
+              call_summary = Lam_call_summary.Direct_primitive primitive;
+              _;
+            }
+          when Lam_primitive.is_relocatable primitive
+               && fully_applied_external arity args ->
+            Lam.prim ~primitive ~args:(List.map ~f:(simpl meta) args)
+              ~loc:ap_info.ap_loc
+        | Some
+            {
+              call_summary =
+                Lam_call_summary.Direct_external
+                  {
+                    dynamic_import = dynamic_import';
+                    id;
+                    name;
+                    arity = direct_arity;
+                    relocatable;
+                  };
+              _;
+            }
+          when
+            relocatable
+            && fully_applied direct_arity args
+            && not
+                 (dynamic_import = dynamic_import' && Ident.same ident id
+                 && String.equal fld_name name) ->
+            simpl meta
+              (Lam.apply
+                 (direct_external_field ~dynamic_import:dynamic_import' id name
+                    ~loc:ap_info.ap_loc)
+                 args (direct_apply_info ap_info))
+        | Some
+            {
+              persistent_closed_lambda =
+                Some ((Lfunction { params; body; _ } as lambda), _);
+              _;
+            }
+          when List.same_length params args
+               && Lam_compile_env.lambda_is_relocatable lambda ->
+            let reduced =
+              Lam_beta_reduce.propagate_beta_reduce meta params body args
+            in
+            let parameter_args =
+              List.filter_map args ~f:(parameter_arg_id meta.ident_tbl)
+            in
+            if
+              parameter_args = []
+              || (cross_module_parameter_result_is_safe reduced
+                 && not
+                      (List.exists parameter_args ~f:(fun param ->
+                           parameter_is_captured param reduced)))
+            then simpl meta reduced
+            else Lam.apply (simpl meta l1) (List.map ~f:(simpl meta) args) ap_info
+        | Some _ | None ->
+            Lam.apply (simpl meta l1) (List.map ~f:(simpl meta) args) ap_info)
+    (* Function inlining interact with other optimizations...
+
+        - parameter attributes
+        - scope issues
+        - code bloat
+    *)
+    | Lapply { ap_func = (Lvar v | Lmutvar v) as fn; ap_args; ap_info } -> (
+        (* Check info for always inlining *)
+
+        (* Ext_log.dwarn __LOC__ "%s/%d" v.name v.stamp;     *)
+        let ap_args = List.map ~f:(simpl meta) ap_args in
+        let[@local] normal () = Lam.apply (simpl meta fn) ap_args ap_info in
+        match Ident.Hashtbl.find meta.ident_tbl v with
+        | value -> (
+            match direct_primitive_of_value value ap_args with
+            | Some primitive ->
+                Lam.prim ~primitive ~args:ap_args ~loc:ap_info.ap_loc
+            | None -> (
+                match direct_external_of_value value ap_args with
+                | Some (dynamic_import, id, name) ->
+                    simpl meta
+                      (Lam.apply
+                         (direct_external_field ~dynamic_import id name
+                            ~loc:ap_info.ap_loc)
+                         ap_args (direct_apply_info ap_info))
+                | None -> (
+                    match value with
+                | FunctionId
+                    {
+                      lambda =
+                        Some
+                          ( Lfunction
+                              ( {
+                                  params;
+                                  body;
+                                  attr = { is_a_functor; _ };
+                                  _;
+                                } as m ),
+                            rec_flag );
+                      _;
+                    } ->
+                    if List.same_length ap_args params (* && false *) then
+                      if
+                        is_a_functor
+                        (* && (Ident.Set.mem v meta.export_idents) && false *)
+                      then
+                        (* TODO: check l1 if it is exported,
+                           if so, maybe not since in that case,
+                           we are going to have two copy?
+                        *)
+                        (* Check: recursive applying may result in non-termination *)
+
+                        (* Ext_log.dwarn __LOC__ "beta .. %s/%d" v.name v.stamp ; *)
+                        simpl meta
+                          (Lam_beta_reduce.propagate_beta_reduce meta params
+                             body ap_args)
+                      else if
+                        (* Lam_analysis.size body < Lam_analysis.small_inline_size *)
+                        (* ap_inlined = Always_inline || *)
+                        Lam_analysis.ok_to_inline_fun_when_app m ap_args
+                      then
+                        (* let param_map =  *)
+                        (*   Lam_analysis.free_variables meta.export_idents  *)
+                        (*     (Lam_analysis.param_map_of_list params) body in *)
+                        (* let old_count = List.length params in *)
+                        (* let new_count = Map_ident.cardinal param_map in *)
+                        let param_map =
+                          Lam_closure.is_closed_with_map meta.export_idents
+                            params body
+                        in
+                        let is_export_id = Ident.Set.mem v meta.export_idents in
+                        match (is_export_id, param_map) with
+                        | false, (_, param_map) | true, (true, param_map) -> (
+                            match rec_flag with
+                            | Lam_rec ->
+                                Lam_beta_reduce.propagate_beta_reduce_with_map
+                                  meta param_map params body ap_args
+                            | Lam_self_rec -> normal ()
+                            | Lam_non_rec ->
+                                if
+                                  List.exists
+                                    ~f:(fun lam -> Lam_hit.hit_variable v lam)
+                                    ap_args
+                                  (*avoid nontermination, e.g, `g(g)`*)
+                                then normal ()
+                                else
+                                  simpl meta
+                                    (Lam_beta_reduce
+                                     .propagate_beta_reduce_with_map meta
+                                       param_map params body ap_args))
+                        | _ -> normal ()
+                      else normal ()
+                    else normal ()
+                | _ -> normal ())))
+        | exception Not_found -> normal ())
+    | Lapply { ap_func = Lfunction { params; body; _ }; ap_args = args; _ }
+      when List.same_length params args ->
+        simpl meta (Lam_beta_reduce.propagate_beta_reduce meta params body args)
+        (* | Lapply{ fn = Lfunction{function_kind =  Tupled;  params; body};  *)
+        (*          args = [Lprim {primitive = Pmakeblock _; args; _}]; _} *)
+        (*   (\* TODO: keep track of this parameter in ocaml trunk, *)
+        (*       can we switch to the tupled backend? *)
+        (*   *\) *)
+        (*   when  List.same_length params args -> *)
+        (*   simpl (Lam_beta_reduce.propagate_beta_reduce meta params body args) *)
+    | Lapply { ap_func = l1; ap_args = ll; ap_info } ->
+        Lam.apply (simpl meta l1) (List.map ~f:(simpl meta) ll) ap_info
+    | Lfunction { arity; params; body; attr } ->
+        Lam.function_ ~arity ~params ~body:(simpl meta body) ~attr
+    | Lswitch
+        ( l,
+          {
+            sw_failaction;
+            sw_consts;
+            sw_blocks;
+            sw_blocks_full;
+            sw_consts_full;
+            sw_names;
+          } ) ->
+        Lam.switch (simpl meta l)
+          {
+            sw_consts = List.map_snd sw_consts ~f:(simpl meta);
+            sw_blocks = List.map_snd sw_blocks ~f:(simpl meta);
+            sw_consts_full;
+            sw_blocks_full;
+            sw_failaction = Option.map ~f:(simpl meta) sw_failaction;
+            sw_names;
+          }
+    | Lstringswitch (l, sw, d) ->
+        let l =
+          match l with
+          | Lvar s | Lmutvar s -> (
+              match Ident.Hashtbl.find meta.ident_tbl s with
+              | Constant s -> Lam.const s
+              | _ | (exception Not_found) -> simpl meta l)
+          | _ -> simpl meta l
+        in
+        Lam.stringswitch l
+          (List.map_snd sw ~f:(simpl meta))
+          (Option.map ~f:(simpl meta) d)
+    | Lstaticraise (i, ls) -> Lam.staticraise i (List.map ~f:(simpl meta) ls)
+    | Lstaticcatch (l1, ids, l2) ->
+        Lam.staticcatch (simpl meta l1) ids (simpl meta l2)
+    | Ltrywith (l1, v, l2) -> Lam.try_ (simpl meta l1) v (simpl meta l2)
+    | Lsequence (l1, l2) -> Lam.seq (simpl meta l1) (simpl meta l2)
+    | Lwhile (l1, l2) -> Lam.while_ (simpl meta l1) (simpl meta l2)
+    | Lfor (flag, l1, l2, dir, l3) ->
+        Lam.for_ flag (simpl meta l1) (simpl meta l2) dir (simpl meta l3)
+    | Lassign (v, l) ->
+        (* Lalias-bound variables are never assigned, so don't increase
+           v's refsimpl *)
+        Lam.assign v (simpl meta l)
+    | Lsend (u, m, o, ll, loc) ->
+        Lam.send u (simpl meta m) (simpl meta o)
+          (List.map ~f:(simpl meta) ll)
+          ~loc
+    | Lifused (v, l) -> Lam.ifused v (simpl meta l)
+  in
+  fun meta lam -> simpl meta lam

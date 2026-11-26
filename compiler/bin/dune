@@ -1,0 +1,27 @@
+(executable
+ (name melc)
+ (public_name melpy)
+ (package melange_python)
+ (modes native)
+ (flags
+  :standard
+  -w
+  -58
+  -open
+  Melange_compiler_libs
+  (:include cmi_flags.sexp))
+ (libraries
+  melange.__private__.melstd
+  melange.__private__.melange_compiler_libs
+  melangelib
+  cmdliner)
+ (modules melc melc_cli)
+ (preprocess
+  (action
+   (run cppo "%{env:CPPO_FLAGS=}" -V OCAML:%{ocaml_version} %{input-file}))))
+
+(rule
+ (targets cmi_flags.sexp)
+ (deps ../gen_cmi_flags.sh)
+ (action
+  (bash "sh ../gen_cmi_flags.sh %{targets}")))
