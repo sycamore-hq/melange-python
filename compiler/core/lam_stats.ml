@@ -1,0 +1,93 @@
+(* Copyright (C) 2015-2016 Bloomberg Finance L.P.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * In addition to the permissions granted to you by the LGPL, you may combine
+ * or link a "work that uses the Library" with a publicly distributed version
+ * of this file to produce a combined library or application, then distribute
+ * that combined work under the terms of your choosing, with no requirement
+ * to comply with the obligations normally placed on you by section 4 of the
+ * LGPL version 3 (or the corresponding section of a later version of the LGPL
+ * should you choose to use a later version).
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. *)
+
+open Import
+
+(* It can be useful for common sub expression elimination ?
+    if two lambdas are not equal, it should return false, other wise,
+    it might return true , this is only used as a way of optimizaton
+
+    Use case :
+    1. switch case -- common fall through
+*)
+
+(* lambda pass for alpha conversion
+    and alias
+    we need think about the order of the pass, might be the alias pass can be done
+    in the  beginning, when we do alpha conversion, we can instrument the table
+*)
+
+(* type alias_tbl =  Ident.t Ident.Hash.t *)
+
+type t = {
+  export_idents : Ident.Set.t;
+  exports : Ident.t list; (* It is kept since order matters? *)
+  ident_tbl : Lam_id_kind.t Ident.Hashtbl.t;
+      (** we don't need count arities for all identifiers, for identifiers
+          for sure it's not a function, there is no need to count them *)
+}
+
+(* let pp_alias_tbl fmt (tbl : alias_tbl) =
+   Ident.Hash.iter  tbl (fun k v -> pp fmt "@[%a -> %a@]@." Ident.print k Ident.print v) *)
+
+let pp_ident_tbl =
+  let to_list h f =
+    Ident.Hashtbl.fold h ~init:[] ~f:(fun ~key:k ~data acc -> f k data :: acc)
+  in
+  fun ident_tbl ->
+    to_list ident_tbl (fun k v ->
+        Pp.box
+          (Pp.concat
+             [
+               Pp.text (Format.asprintf "%a" Ident.print k);
+               Pp.text " -> ";
+               Pp.text (Format.asprintf "%a" Lam_id_kind.print v);
+             ]))
+    |> Pp.concat ~sep:Pp.newline
+
+let print (v : t) =
+  Pp.concat ~sep:Pp.newline
+    [
+      Pp.box
+        (Pp.concat ~sep:Pp.space
+           [ Pp.text "Ident table:"; Pp.box (pp_ident_tbl v.ident_tbl) ]);
+      Pp.box
+        (Pp.concat ~sep:Pp.space
+           [
+             Pp.text "exports:";
+             Pp.box
+               (Pp.concat ~sep:(Pp.text "; ")
+                  (List.map
+                     ~f:(fun export ->
+                       Pp.text (Format.asprintf "%a" Ident.print export))
+                     v.exports));
+           ]);
+    ]
+
+let make ~export_idents ~export_ident_sets : t =
+  {
+    ident_tbl = Ident.Hashtbl.create 31;
+    exports = export_idents;
+    export_idents = export_ident_sets;
+  }

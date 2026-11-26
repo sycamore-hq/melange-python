@@ -1,0 +1,440 @@
+(* Copyright (C) 2018 Hongbo Zhang, Authors of ReScript
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * In addition to the permissions granted to you by the LGPL, you may combine
+ * or link a "work that uses the Library" with a publicly distributed version
+ * of this file to produce a combined library or application, then distribute
+ * that combined work under the terms of your choosing, with no requirement
+ * to comply with the obligations normally placed on you by section 4 of the
+ * LGPL version 3 (or the corresponding section of a later version of the LGPL
+ * should you choose to use a later version).
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. *)
+
+open Import
+module External_ffi_types = Melange_ffi.External_ffi_types
+
+module Record_representation = struct
+  type t =
+    | Record_regular
+    | Record_inlined of {
+        tag : int;
+        name : string;
+        num_nonconsts : int;
+        attributes : Parsetree.attributes;
+      }
+      (* Inlined record *)
+    | Record_extension
+  (* Inlined record under extension *)
+
+  let equal p0 p1 =
+    match (p0, p1) with
+    | Record_regular, Record_regular -> true
+    | ( Record_inlined
+          {
+            tag = tag0;
+            name = name0;
+            num_nonconsts = nonconsts0;
+            attributes = attrs0;
+          },
+        Record_inlined
+          {
+            tag = tag1;
+            name = name1;
+            num_nonconsts = nonconsts1;
+            attributes = attrs1;
+          } ) ->
+        Int.equal tag0 tag1 && String.equal name0 name1
+        && Int.equal nonconsts0 nonconsts1
+        && attrs0 = attrs1
+    | Record_extension, Record_extension -> true
+    | _, _ -> false
+end
+
+type t =
+  | Pbytes_to_string
+  | Pbytes_of_string
+  (* Operations on heap blocks *)
+  | Pmakeblock of int * Melange_ffi.Lam_tag_info.t * Asttypes.mutable_flag
+  | Pfield of int * Lam_compat.Field_dbg_info.t
+  | Psetfield of int * Lam_compat.Set_field_dbg_info.t
+  (* could have field info at least for record *)
+  | Pduprecord of Record_representation.t
+  (* Force lazy values *)
+  | Plazyforce
+  (* External call *)
+  | Pccall of { prim_name : string }
+  | Pjs_call of {
+      prim_name : string;
+      arg_types :
+        Melange_ffi.External_arg_spec.Arg_label.t
+        Melange_ffi.External_arg_spec.Param.t
+        list;
+      ffi : Melange_ffi.External_ffi_types.External_spec.t;
+      dynamic_import : bool;
+    }
+  | Pjs_object_create of
+      Melange_ffi.External_arg_spec.Obj_label.t
+      Melange_ffi.External_arg_spec.Param.t
+      list
+  (* Exceptions *)
+  | Praise
+  (* Boolean operations *)
+  | Psequand
+  | Psequor
+  | Pnot
+  (* Integer operations *)
+  | Pnegint
+  | Paddint
+  | Psubint
+  | Pmulint
+  | Pdivint
+  | Pmodint
+  | Pandint
+  | Porint
+  | Pxorint
+  | Plslint
+  | Plsrint
+  | Pasrint
+  | Poffsetint of int
+  | Poffsetref of int
+  (* Float operations *)
+  | Pintoffloat
+  | Pfloatofint
+  | Pnegfloat
+  | Paddfloat
+  | Psubfloat
+  | Pmulfloat
+  | Pdivfloat
+  | Pintcomp of Lam_compat.Integer_comparison.t
+  | Pfloatcomp of Lam_compat.Float_comparison.t
+  | Pjscomp of Lam_compat.Integer_comparison.t
+  | Pint64comp of Lam_compat.Integer_comparison.t
+  | Pjs_apply (*[f;arg0;arg1; arg2; ... argN]*)
+  | Pjs_runtime_apply (* [f; [...]] *)
+  (* String operations *)
+  | Pstringlength
+  | Pstringrefu
+  | Pstringrefs
+  | Pstringadd
+  | Pbyteslength
+  | Pbytesrefu
+  | Pbytessetu
+  | Pbytesrefs
+  | Pbytessets
+  | Pstring_load_16 of bool
+  | Pstring_load_32 of bool
+  | Pstring_load_64 of bool
+  | Pbytes_load_16 of bool
+  | Pbytes_load_32 of bool
+  | Pbytes_load_64 of bool
+  | Pbytes_set_16 of bool
+  | Pbytes_set_32 of bool
+  | Pbytes_set_64 of bool
+  (* Array operations *)
+  | Pmakearray
+  | Parraylength
+  | Parrayrefu
+  | Parraysetu
+  | Parrayrefs
+  | Parraysets
+  (* Test if the argument is a block or an immediate integer *)
+  | Pisint
+  | Pis_poly_var_const
+  (* Test if the (integer) argument is outside an interval *)
+  | Pisout of int
+  | Pint64ofint
+  | Pintofint64
+  | Pnegint64
+  | Paddint64
+  | Psubint64
+  | Pmulint64
+  | Pdivint64
+  | Pmodint64
+  | Pandint64
+  | Porint64
+  | Pxorint64
+  | Plslint64
+  | Plsrint64
+  | Pasrint64
+  (* Compile time constants *)
+  | Pctconst of
+      Lam_compat.Compile_time_constant.t (* Integer to external pointer *)
+  | Pbswap16
+  | Pbbswap of Lam_compat.Boxed_integer.t
+  (* Inhibition of optimisation *)
+  | Popaque
+  (* JS specific *)
+  | Pdebugger
+  | Pjs_unsafe_downgrade of { name : string; setter : bool; loc : Location.t }
+  | Pinit_mod
+  | Pupdate_mod
+  | Praw_js_code of Melange_ffi.Js_raw_info.t
+  | Pjs_fn_make of int
+  | Pvoid_run
+  | Pfull_apply
+  (* we wrap it when do the conversion to prevent
+     accidental optimization
+     play safe first
+  *)
+  | Pjs_fn_method
+  | Pundefined_to_opt
+  | Pnull_to_opt
+  | Pnull_undefined_to_opt
+  | Pis_null
+  | Pis_undefined
+  | Pis_null_undefined
+  | Pimport
+  | Pjs_typeof
+  | Pjs_function_length
+  | Pcaml_obj_length
+  | Pwrap_exn
+    (* convert either JS exception or OCaml exception into OCaml format *)
+  | Pcreate_extension of string
+  | Pis_not_none (* no info about its type *)
+  | Pval_from_option
+  | Pval_from_option_not_nest
+  | Psome
+  | Psome_not_nest
+  | Pfield_computed (* Mostly used in object compilation *)
+  | Psetfield_computed
+
+let eq_approx (lhs : t) (rhs : t) =
+  match lhs with
+  | Pcreate_extension a -> (
+      match rhs with Pcreate_extension b -> a = (b : string) | _ -> false)
+  | Pwrap_exn -> rhs = Pwrap_exn
+  | Pbytes_to_string -> rhs = Pbytes_to_string
+  | Pbytes_of_string -> rhs = Pbytes_of_string
+  | Praise -> rhs = Praise
+  | Psequand -> rhs = Psequand
+  | Psequor -> rhs = Psequor
+  | Pnot -> rhs = Pnot
+  | Pnegint -> rhs = Pnegint
+  | Paddint -> rhs = Paddint
+  | Psubint -> rhs = Psubint
+  | Pmulint -> rhs = Pmulint
+  | Pdivint -> rhs = Pdivint
+  | Pmodint -> rhs = Pmodint
+  | Pandint -> rhs = Pandint
+  | Porint -> rhs = Porint
+  | Pxorint -> rhs = Pxorint
+  | Plslint -> rhs = Plslint
+  | Plsrint -> rhs = Plsrint
+  | Pasrint -> rhs = Pasrint
+  | Pval_from_option -> rhs = Pval_from_option
+  | Pval_from_option_not_nest -> rhs = Pval_from_option_not_nest
+  | Plazyforce -> rhs = Plazyforce
+  | Pintoffloat -> rhs = Pintoffloat
+  | Pfloatofint -> rhs = Pfloatofint
+  | Pnegfloat -> rhs = Pnegfloat
+  (* | Pabsfloat -> rhs = Pabsfloat *)
+  | Paddfloat -> rhs = Paddfloat
+  | Psubfloat -> rhs = Psubfloat
+  | Pmulfloat -> rhs = Pmulfloat
+  | Pdivfloat -> rhs = Pdivfloat
+  | Pjs_apply -> rhs = Pjs_apply
+  | Pjs_runtime_apply -> rhs = Pjs_runtime_apply
+  | Pstringlength -> rhs = Pstringlength
+  | Pstringrefu -> rhs = Pstringrefu
+  | Pstringrefs -> rhs = Pstringrefs
+  | Pstringadd -> rhs = Pstringadd
+  | Pbyteslength -> rhs = Pbyteslength
+  | Pbytesrefu -> rhs = Pbytesrefu
+  | Pbytessetu -> rhs = Pbytessetu
+  | Pbytesrefs -> rhs = Pbytesrefs
+  | Pbytessets -> rhs = Pbytessets
+  | Pstring_load_16 b1 -> (
+      match rhs with Pstring_load_16 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pstring_load_32 b1 -> (
+      match rhs with Pstring_load_32 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pstring_load_64 b1 -> (
+      match rhs with Pstring_load_64 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_load_16 b1 -> (
+      match rhs with Pbytes_load_16 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_load_32 b1 -> (
+      match rhs with Pbytes_load_32 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_load_64 b1 -> (
+      match rhs with Pbytes_load_64 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_set_16 b1 -> (
+      match rhs with Pbytes_set_16 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_set_32 b1 -> (
+      match rhs with Pbytes_set_32 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pbytes_set_64 b1 -> (
+      match rhs with Pbytes_set_64 b2 -> Bool.equal b1 b2 | _ -> false)
+  | Pundefined_to_opt -> rhs = Pundefined_to_opt
+  | Pnull_to_opt -> rhs = Pnull_to_opt
+  | Pnull_undefined_to_opt -> rhs = Pnull_undefined_to_opt
+  | Pis_null -> rhs = Pis_null
+  | Pis_not_none -> rhs = Pis_not_none
+  | Psome -> rhs = Psome
+  | Psome_not_nest -> rhs = Psome_not_nest
+  | Pis_undefined -> rhs = Pis_undefined
+  | Pis_null_undefined -> rhs = Pis_null_undefined
+  | Pimport -> rhs = Pimport
+  | Pjs_typeof -> rhs = Pjs_typeof
+  | Pisint -> rhs = Pisint
+  | Pis_poly_var_const -> rhs = Pis_poly_var_const
+  | Pisout l -> ( match rhs with Pisout r -> l = r | _ -> false)
+  | Pdebugger -> rhs = Pdebugger
+  | Pinit_mod -> rhs = Pinit_mod
+  | Pupdate_mod -> rhs = Pupdate_mod
+  | Pjs_function_length -> rhs = Pjs_function_length
+  (* | Pjs_string_of_small_array -> rhs = Pjs_string_of_small_array *)
+  (* | Pjs_is_instance_array -> rhs = Pjs_is_instance_array *)
+  | Pcaml_obj_length -> rhs = Pcaml_obj_length
+  (* | Pcaml_obj_set_length -> rhs = Pcaml_obj_set_length *)
+  | Pccall { prim_name = n0 } -> (
+      match rhs with
+      | Pccall { prim_name = n1 } -> String.equal n0 n1
+      | _ -> false)
+  | Pfield (n0, info0) -> (
+      match rhs with
+      | Pfield (n1, info1) ->
+          Int.equal n0 n1 && Lam_compat.Field_dbg_info.equal info0 info1
+      | _ -> false)
+  | Psetfield (i0, info0) -> (
+      match rhs with
+      | Psetfield (i1, info1) ->
+          Int.equal i0 i1 && Lam_compat.Set_field_dbg_info.equal info0 info1
+      | _ -> false)
+  | Pmakeblock (i0, info0, flag0) -> (
+      match rhs with
+      | Pmakeblock (i1, info1, flag1) ->
+          Int.equal i0 i1 && flag0 = flag1
+          && Melange_ffi.Lam_tag_info.equal info0 info1
+      | _ -> false)
+  | Pduprecord record_repesentation0 -> (
+      match rhs with
+      | Pduprecord record_repesentation1 ->
+          Record_representation.equal record_repesentation0
+            record_repesentation1
+      | _ -> false)
+  | Pjs_call { prim_name; arg_types; ffi; dynamic_import } -> (
+      match rhs with
+      | Pjs_call rhs ->
+          String.equal prim_name rhs.prim_name
+          && List.equal
+               ~eq:
+                 (Melange_ffi.External_arg_spec.Param.equal
+                    ~eq:Melange_ffi.External_arg_spec.Arg_label.equal)
+               arg_types rhs.arg_types
+          && Melange_ffi.External_ffi_types.External_spec.equal ffi rhs.ffi
+          && Bool.equal dynamic_import rhs.dynamic_import
+      | _ -> false)
+  | Pjs_object_create obj_create -> (
+      match rhs with
+      | Pjs_object_create obj_create1 ->
+          List.equal
+            ~eq:
+              (Melange_ffi.External_arg_spec.Param.equal
+                 ~eq:Melange_ffi.External_arg_spec.Obj_label.equal)
+            obj_create obj_create1
+      | _ -> false)
+  | Pintcomp comparison -> (
+      match rhs with
+      | Pintcomp comparison1 ->
+          Lam_compat.Integer_comparison.equal comparison comparison1
+      | _ -> false)
+  | Pfloatcomp comparison -> (
+      match rhs with
+      | Pfloatcomp comparison1 ->
+          Lam_compat.Float_comparison.equal comparison comparison1
+      | _ -> false)
+  | Pjscomp comparison -> (
+      match rhs with
+      | Pjscomp comparison1 ->
+          Lam_compat.Integer_comparison.equal comparison comparison1
+      | _ -> false)
+  | Poffsetint i0 -> (
+      match rhs with Poffsetint i1 -> Int.equal i0 i1 | _ -> false)
+  | Poffsetref i0 -> (
+      match rhs with Poffsetref i1 -> Int.equal i0 i1 | _ -> false)
+  | Pmakearray -> rhs = Pmakearray
+  | Parraylength -> rhs = Parraylength
+  | Parrayrefu -> rhs = Parrayrefu
+  | Parraysetu -> rhs = Parraysetu
+  | Parrayrefs -> rhs = Parrayrefs
+  | Parraysets -> rhs = Parraysets
+  | Pint64ofint -> rhs = Pint64ofint
+  | Pintofint64 -> rhs = Pintofint64
+  | Pnegint64 -> rhs = Pnegint64
+  | Paddint64 -> rhs = Paddint64
+  | Psubint64 -> rhs = Psubint64
+  | Pmulint64 -> rhs = Pmulint64
+  | Pdivint64 -> rhs = Pdivint64
+  | Pmodint64 -> rhs = Pmodint64
+  | Pandint64 -> rhs = Pandint64
+  | Porint64 -> rhs = Porint64
+  | Pxorint64 -> rhs = Pxorint64
+  | Plslint64 -> rhs = Plslint64
+  | Plsrint64 -> rhs = Plsrint64
+  | Pasrint64 -> rhs = Pasrint64
+  | Pint64comp comparison -> (
+      match rhs with
+      | Pint64comp comparison1 ->
+          Lam_compat.Integer_comparison.equal comparison comparison1
+      | _ -> false)
+  | Pctconst compile_time_constant -> (
+      match rhs with
+      | Pctconst compile_time_constant1 ->
+          Lam_compat.Compile_time_constant.equal compile_time_constant
+            compile_time_constant1
+      | _ -> false)
+  | Pbswap16 -> rhs = Pbswap16
+  | Pbbswap i1 -> (
+      match rhs with
+      | Pbbswap i2 -> Lam_compat.Boxed_integer.equal i1 i2
+      | _ -> false)
+  | Popaque -> ( match rhs with Popaque -> true | _ -> false)
+  | Pjs_unsafe_downgrade { name; loc = _; setter } -> (
+      match rhs with
+      | Pjs_unsafe_downgrade rhs ->
+          String.equal name rhs.name && Bool.equal setter rhs.setter
+      | _ -> false)
+  | Pjs_fn_make i -> (
+      match rhs with Pjs_fn_make i1 -> Int.equal i i1 | _ -> false)
+  | Pvoid_run -> rhs = Pvoid_run
+  | Pfull_apply -> rhs = Pfull_apply
+  | Pjs_fn_method -> rhs = Pjs_fn_method
+  | Praw_js_code _ -> false (* TOO lazy, here comparison is only approximation*)
+  | Pfield_computed -> rhs = Pfield_computed
+  | Psetfield_computed -> rhs = Psetfield_computed
+
+let external_module_name_is_relative
+    ({ bundle; module_bind_name = _ } :
+      External_ffi_types.External_module_name.t) =
+  Paths.is_relative_module_specifier bundle
+
+let external_module_name_option_is_relative = function
+  | Some module_name -> external_module_name_is_relative module_name
+  | None -> false
+
+let external_spec_uses_relative_module
+    (ffi : External_ffi_types.External_spec.t) =
+  let open External_ffi_types.External_spec in
+  match ffi with
+  | Js_var { external_module_name; _ }
+  | Js_call { external_module_name; _ }
+  | Js_new { external_module_name; _ } ->
+      external_module_name_option_is_relative external_module_name
+  | Js_module_as_var external_module_name
+  | Js_module_as_fn { external_module_name; _ }
+  | Js_module_as_class external_module_name ->
+      external_module_name_is_relative external_module_name
+  | Js_send _ | Js_set _ | Js_get _ | Js_get_index _ | Js_set_index _ -> false
+
+let is_relocatable = function
+  | Pjs_call { ffi; _ } -> not (external_spec_uses_relative_module ffi)
+  | _ -> true

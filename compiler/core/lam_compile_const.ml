@@ -1,0 +1,109 @@
+(* Copyright (C) 2015-2016 Bloomberg Finance L.P.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * In addition to the permissions granted to you by the LGPL, you may combine
+ * or link a "work that uses the Library" with a publicly distributed version
+ * of this file to produce a combined library or application, then distribute
+ * that combined work under the terms of your choosing, with no requirement
+ * to comply with the obligations normally placed on you by section 4 of the
+ * LGPL version 3 (or the corresponding section of a later version of the LGPL
+ * should you choose to use a later version).
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA. *)
+
+open Import
+module E = Js_exp_make
+
+type nest = Unnest | Nest of (int * Lam.Constant.t)
+
+let rec translate (x : Lam.Constant.t) : J.expression =
+  match x with
+  | Const_module_alias -> E.undefined (*  TODO *)
+  | Const_some s -> translate_some s
+  | Const_js_true -> E.bool true
+  | Const_js_false -> E.bool false
+  | Const_js_null -> E.nil
+  | Const_js_undefined { is_unit = true } -> E.unit
+  | Const_js_undefined { is_unit = false } -> E.undefined
+  | Const_int { i; comment = cstr_data } -> (
+      let comment = Lam.Constant.comment_of_pointer_info cstr_data in
+      match Lam.Constant.modifier_of_pointer_info cstr_data with
+      | None -> E.int i ?comment
+      | Some modifier -> E.as_value ?comment modifier)
+  | Const_char i -> Js_of_lam_string.const_char i
+  (* E.float (Int32.to_string i) *)
+  | Const_int64 i ->
+      (*
+            TODO:
+       {[
+         Int64.to_string 0x7FFFFFFFFFFFFFFFL;;
+         - : string = "9223372036854775807"
+       ]}
+       {[
+         Int64.(to_float max_int);;
+         - : float = 9.22337203685477581e+18
+       ]}
+       Note we should compile it to Int64 as JS's
+       special representation --
+       it is not representatble in JS number
+    *)
+      (* E.float (Int64.to_string i) *)
+      Js_long.of_const i
+      (* https://github.com/google/closure-library/blob/master/closure%2Fgoog%2Fmath%2Flong.js *)
+  | Const_float f -> E.float f (* TODO: preserve float *)
+  | Const_string { s; unicode = false } -> E.str s
+  | Const_string { s; unicode = true } -> E.unicode s
+  | Const_pointer name -> E.str name
+  | Const_block (tag, tag_info, xs) ->
+      Js_of_lam_block.make_block NA tag_info (E.small_int tag)
+        (List.map ~f:translate xs)
+  | Const_float_array ars ->
+      (* according to the compiler
+          const_float_array is immutable
+         {[ Lprim(Pccall prim_obj_dup, [master]) ]},
+          however, we can not translate
+         {[ prim_obj_dup(x) =>  x' ]}
+          since x' is now mutable, prim_obj_dup does a copy,
+
+          the compiler does this  is mainly to extract common data into data section,
+          we  deoptimized this in js backend? so it is actually mutable
+      *)
+      (* TODO-- *)
+      Js_of_lam_array.make_array Mutable (List.map ~f:E.float ars)
+(* E.arr Mutable ~comment:"float array" *)
+(*   (Ext_list.map (fun x ->  E.float  x ) ars) *)
+
+and translate_some =
+  let rec is_some_none_aux (x : Lam.Constant.t) acc =
+    match x with
+    | Const_some v -> is_some_none_aux v (acc + 1)
+    | Const_module_alias | Const_js_undefined _ -> Nest (acc, x)
+    | _ -> Unnest
+  in
+  let rec nested_some_none n none =
+    match n with
+    | 0 -> none
+    | n -> nested_some_none (n - 1) (E.optional_block none)
+  in
+  fun (x : Lam.Constant.t) : J.expression ->
+    match is_some_none_aux x 0 with
+    | Unnest -> E.optional_not_nest_block (translate x)
+    | Nest (depth, lam) ->
+        nested_some_none depth (E.optional_block (translate lam))
+
+let translate_arg_cst (cst : Melange_ffi.External_arg_spec.Arg_cst.t) =
+  match cst with
+  | Int i -> E.int (Int32.of_int i)
+  | Str i -> E.str i
+  | Js_literal s -> E.raw_js_code (Exp (Js_literal { comment = None })) s

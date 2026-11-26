@@ -1,0 +1,26 @@
+(rule
+ (alias default)
+ (targets (dir dist))
+ (deps
+  hello.ml
+  ../../runtime/melange_runtime/__init__.py
+  ../../runtime/melange_runtime/stdio.py)
+ (action
+  (bash
+    "set -eu
+     mkdir -p dist/melange_runtime
+     cp %{dep:../../runtime/melange_runtime/__init__.py} dist/melange_runtime/__init__.py
+     cp %{dep:../../runtime/melange_runtime/stdio.py} dist/melange_runtime/stdio.py
+     prefix=$(ocamlfind query melange)
+     export MELANGELIB=\"$prefix/melange:$prefix/js/melange\"
+     tmp=$(mktemp -d)
+     trap 'rm -rf \"$tmp\"' EXIT
+     cp %{dep:hello.ml} \"$tmp/hello.ml\"
+     %{bin:melpy} --target python -o \"$tmp/hello.py\" \"$tmp/hello.ml\"
+     cp \"$tmp/hello.py\" dist/hello.py")))
+
+(rule
+ (alias runtest)
+ (deps dist)
+ (action
+  (bash "set -eu; out=$(python3 dist/hello.py); test \"$out\" = hello")))

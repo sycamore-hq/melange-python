@@ -1,3 +1,8 @@
+The MIT License below applies to the runtime and tooling in this
+repository. It does not apply to compiler/, which is licensed under
+the GNU Lesser General Public License, version 2.1 or later
+(see compiler/LICENSE and README.md, "Licensing").
+
 MIT License
 
 Copyright (c) 2026 Nathan Sculli
